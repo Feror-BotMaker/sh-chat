@@ -10,13 +10,17 @@
 #include <sys/ioctl.h>
 #include "../state.c"
 
+#define PRINT_USER_INPUT_SIGNAL 10
+
 Channel* selected_channel = NULL;
 
 State* current_state = NULL;
 
 volatile char* user_input;
 
-pthread_mutex_t user_input_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+pthread_t state_thread;
+pthread_t input_thread;
 
 /**
  * @brief Affiche l'interface du client.
@@ -219,11 +223,75 @@ void display_state(State* state) {
 
   // La dernière ligne est réservée pour la saisie de texte
   // On affiche tout de même le séparateur
-  pthread_mutex_lock(&user_input_mutex);
-  printf("                    │ > %s", user_input);
-  pthread_mutex_unlock(&user_input_mutex);
+  printf("                    │ > ");
+
+  pthread_kill(input_thread, PRINT_USER_INPUT_SIGNAL);
 
   // On force l'affichage, car on a utilisé printf sans saut de ligne
+  fflush(stdout);
+}
+
+
+/**
+ * @brief Écoute sur le socket pour recevoir les nouveaux
+ *        états envoyés par le serveur, puis utilise display_state
+ *        pour l'afficher.
+ *
+ * @param arg {int*} Le socket de connexion au serveur
+ * @return {void*}
+ */
+void* listen_for_new_state(void* arg) {
+  int client_socket = *(int*)arg;
+
+  while (1) {
+    size_t size;
+    if (read(client_socket, &size, sizeof(size_t)) == -1) {
+      perror("- x - Erreur lors de la lecture de la taille de l'état");
+      close(client_socket);
+      exit(1);
+    }
+
+    char* buffer = malloc(size);
+    if (!buffer) {
+      perror("- x - Erreur lors de l'allocation du tampon");
+      close(client_socket);
+      exit(1);
+    }
+
+    if (read(client_socket, buffer, size) == -1) {
+      perror("- x - Erreur lors de la lecture de l'état");
+      close(client_socket);
+      exit(1);
+    }
+
+    printf("- √ - État reçu\n");
+    State* state = deserialize_state(buffer);
+
+    if (selected_channel == NULL) {
+      selected_channel = &state->channels[0];
+    }
+
+    // On resélectionne le canal si possible
+    for (int i = 0; i < state->channel_count; i++) {
+      if (strcmp(state->channels[i].name, selected_channel->name) == 0) {
+        selected_channel = &state->channels[i];
+        break;
+      }
+    }
+
+    free(current_state);
+
+    current_state = state;
+
+    display_state(state);
+
+    free(buffer);
+  }
+}
+
+void print_user_input(int signal) {
+  char* buffer = strdup((const char*)user_input);
+  printf("%s", strlen(buffer) > 0 ? buffer : "(vide)");
   fflush(stdout);
 }
 
@@ -237,25 +305,29 @@ void display_state(State* state) {
 void* expect_user_input(void* arg) {
   int client_socket = *(int*)arg;
 
+  // Initialiser le user_input
+  user_input = malloc(2 * sizeof(char));
+  user_input[0] = 'a';
+  user_input[1] = '\0';
+
+  // On lie le signal à la fonction d'affichage
+  signal(PRINT_USER_INPUT_SIGNAL, print_user_input);
+
   while (1) {
     while (1) {
       // On récupère charactère par charactère
       char c = getchar();
 
       if (c == '\n') {
-        pthread_mutex_lock(&user_input_mutex);
         if (strlen(user_input) > 0) {
-          pthread_mutex_unlock(&user_input_mutex);
           break;
         }
         else {
-          pthread_mutex_unlock(&user_input_mutex);
           continue;
         }
       }
 
       // On ajoute le charactère au global user_input
-      pthread_mutex_lock(&user_input_mutex);
       size_t user_input_length = strlen((const char*)user_input);
       user_input = realloc((void*)user_input, user_input_length + 2);
       if (!user_input) {
@@ -265,12 +337,9 @@ void* expect_user_input(void* arg) {
       }
       user_input[user_input_length] = c;
       user_input[user_input_length + 1] = '\0';
-      pthread_mutex_unlock(&user_input_mutex);
     }
 
-    pthread_mutex_lock(&user_input_mutex);
     char* buffer = strdup((const char*)user_input);
-    pthread_mutex_unlock(&user_input_mutex);
 
     // Enlever le saut de ligne
     buffer[strcspn(buffer, "\n")] = 0;
@@ -382,70 +451,11 @@ void* expect_user_input(void* arg) {
 
     free(buffer);
 
-    pthread_mutex_lock(&user_input_mutex);
     free((void*)user_input);
     user_input = malloc(1 * sizeof(char));
     user_input[0] = '\0';
-    pthread_mutex_unlock(&user_input_mutex);
 
     display_state(current_state);
-  }
-}
-
-/**
- * @brief Écoute sur le socket pour recevoir les nouveaux
- *        états envoyés par le serveur, puis utilise display_state
- *        pour l'afficher.
- *
- * @param arg {int*} Le socket de connexion au serveur
- * @return {void*}
- */
-void* listen_for_new_state(void* arg) {
-  int client_socket = *(int*)arg;
-
-  while (1) {
-    size_t size;
-    if (read(client_socket, &size, sizeof(size_t)) == -1) {
-      perror("- x - Erreur lors de la lecture de la taille de l'état");
-      close(client_socket);
-      exit(1);
-    }
-
-    char* buffer = malloc(size);
-    if (!buffer) {
-      perror("- x - Erreur lors de l'allocation du tampon");
-      close(client_socket);
-      exit(1);
-    }
-
-    if (read(client_socket, buffer, size) == -1) {
-      perror("- x - Erreur lors de la lecture de l'état");
-      close(client_socket);
-      exit(1);
-    }
-
-    printf("- √ - État reçu\n");
-    State* state = deserialize_state(buffer);
-
-    if (selected_channel == NULL) {
-      selected_channel = &state->channels[0];
-    }
-
-    // On resélectionne le canal si possible
-    for (int i = 0; i < state->channel_count; i++) {
-      if (strcmp(state->channels[i].name, selected_channel->name) == 0) {
-        selected_channel = &state->channels[i];
-        break;
-      }
-    }
-
-    free(current_state);
-
-    current_state = state;
-
-    display_state(state);
-
-    free(buffer);
   }
 }
 
@@ -454,10 +464,6 @@ int main(int argc, char* argv[]) {
     fprintf(stderr, "- x - Usage: %s <Adresse IP> <Port>\n", argv[0]);
     exit(1);
   }
-
-  // Initialiser le user_input
-  user_input = malloc(1 * sizeof(char));
-  user_input[0] = '\0';
 
   const char* ip_address = argv[1];
   int port = atoi(argv[2]);
@@ -492,11 +498,9 @@ int main(int argc, char* argv[]) {
   }
 
   // Étape 4 : Lancer un thread pour écouter les mises à jour de l'état
-  pthread_t state_thread;
   pthread_create(&state_thread, NULL, listen_for_new_state, &client_socket);
 
   // Étape 5 : Lancer un thread pour attendre les saisies de l'utilisateur
-  pthread_t input_thread;
   pthread_create(&input_thread, NULL, expect_user_input, &client_socket);
 
   pthread_join(state_thread, NULL);
