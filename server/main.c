@@ -11,6 +11,7 @@
 #include <unistd.h>
 #include <time.h>
 #include "../state.c"
+#include "../my_file_struct.c"
 
 #define MAX_CLIENTS 100
 
@@ -21,6 +22,9 @@ int client_sockets[MAX_CLIENTS];
 pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 State server_state;
+
+MyFileStruct* stored_files;
+int stored_files_count = 0;
 
 /**
  * @brief Envoie l'état actuel du serveur à tous les clients
@@ -172,7 +176,8 @@ void* handle_client(void* client_socket) {
       }
 
       // Extraire le message du buffer
-      char* message = strtok(NULL, "");
+      char* p = strtok(NULL, "");
+      char* message = strdup(p);
 
       // Ajouter le message au canal
       pthread_mutex_lock(&clients_mutex);
@@ -237,10 +242,190 @@ void* handle_client(void* client_socket) {
       // Enregistrer le nouvel état dans un fichier
       save_state_to_file(&server_state, "state.bin");
     }
+    else if (buffer[0] == '.') { // Si le message commence par un ., c'est un fichier
+      printf("- i - Fichier reçu\n");
+      // Directement après le ., on a le channel
+      // Trouver le canal correspondant
+      char* channel_name = strtok(buffer, " ");
+      Channel* channel = NULL;
+
+      channel_name++; // On enlève le point
+
+      printf("- i - Nom du canal : %s\n", channel_name);
+
+      for (int i = 0; i < server_state.channel_count; i++) {
+        if (strcmp(server_state.channels[i].name, channel_name) == 0) {
+          channel = &server_state.channels[i];
+          break;
+        }
+      }
+
+      if (channel == NULL) {
+        printf("- x - Canal non trouvé : %s\n", channel_name);
+        free(buffer);
+        continue;
+      }
+
+      printf("- i - Canal trouvé\n");
+
+
+      // Puis on a la version sérialisée du fichier.
+      char* file_buffer = strtok(NULL, "");
+
+      // On désérialise le fichier
+      MyFileStruct* file = deserialize_my_file_struct(file_buffer);
+
+      if (!file) {
+        printf("- x - Erreur lors de la désérialisation du fichier\n");
+        free(buffer);
+        continue;
+      }
+
+      printf("- i - Fichier désérialisé\n");
+      printf("- i - Nom du fichier : %s\n", file->file_name);
+      printf("- i - Contenu du fichier : %s\n", file->file_content);
+      printf("- i - UUID du fichier : %s\n", file->uuid);
+
+      // On ajoute le fichier à la liste des fichiers
+
+      stored_files = realloc(stored_files, sizeof(MyFileStruct) * (stored_files_count + 1));
+      stored_files[stored_files_count] = *file;
+      stored_files_count++;
+
+      printf("- i - Fichier ajouté à la liste\n");
+
+      // On envoie un message au canal pour informer de l'ajout du fichier
+      pthread_mutex_lock(&clients_mutex);
+
+      // On réalloue la mémoire pour le nouveau message
+      Message* new_messages = realloc(channel->messages, sizeof(Message) * (channel->message_count + 2));
+      if (!new_messages) {
+        perror("- x - Failed to reallocate messages array");
+        pthread_mutex_unlock(&clients_mutex);
+        free(buffer);
+        continue;
+      }
+      channel->messages = new_messages;
+
+      // On alloue la mémoire pour le texte du message
+      channel->messages[channel->message_count].text = malloc(256);
+      if (!channel->messages[channel->message_count].text) {
+        perror("- x - Failed to allocate message text");
+        pthread_mutex_unlock(&clients_mutex);
+        free(buffer);
+        continue;
+      }
+
+      // On formate le message
+      snprintf(channel->messages[channel->message_count].text, 256,
+        "\033[1;34ma envoyé un fichier :\033[0;0m %s", file->file_name);
+      channel->messages[channel->message_count].sender_fd = socket_index;
+      channel->messages[channel->message_count].timestamp = time(NULL);
+      channel->message_count++;
+
+      // On alloue la mémoire pour le texte du message
+      channel->messages[channel->message_count].text = malloc(256);
+      if (!channel->messages[channel->message_count].text) {
+        perror("- x - Failed to allocate message text");
+        pthread_mutex_unlock(&clients_mutex);
+        free(buffer);
+        continue;
+      }
+
+      // On formate le message
+      snprintf(channel->messages[channel->message_count].text, 256,
+        "Pour le télécharger, utilisez \033[1;34m/download %s\033[0;0m", file->uuid);
+      channel->messages[channel->message_count].sender_fd = socket_index;
+      channel->messages[channel->message_count].timestamp = time(NULL);
+      channel->message_count++;
+
+      pthread_mutex_unlock(&clients_mutex);
+
+      printf("- i - Message ajouté au canal\n");
+
+      // Envoyer le nouvel état à tous les clients
+      broadcast_state(&server_state);
+
+      // Enregistrer le nouvel état dans un fichier
+      save_state_to_file(&server_state, "state.bin");
+
+      printf("- i - Fichier ajouté avec succès\n");
+    }
+    else if (buffer[0] == '<') {
+      // On a une demande de téléchargement de fichier.
+      // On commence par extraire l'UUID du fichier
+      char* uuid = buffer + 1;
+
+      printf("- i - Demande de téléchargement du fichier : %s\n", uuid);
+
+      // On cherche le fichier correspondant
+      MyFileStruct* file = NULL;
+
+      for (int i = 0; i < stored_files_count; i++) {
+        if (strcmp(stored_files[i].uuid, uuid) == 0) {
+          file = &stored_files[i];
+          break;
+        }
+      }
+
+      if (file == NULL) {
+        printf("- x - Fichier non trouvé : %s\n", uuid);
+        free(buffer);
+        continue;
+      }
+
+      // On envoie le fichier au client
+      size_t file_size;
+      char* serialized_file = serialize_my_file_struct(file, &file_size);
+
+      // On l'envoie au format ><serialized_file>
+      size_t message_size = 1 + file_size + 1;
+
+      // Allouer le buffer du message
+      char* message_buffer = malloc(message_size);
+
+      if (!message_buffer) {
+        perror("- x - Erreur lors de l'allocation du tampon de message");
+        free(serialized_file);
+        free(buffer);
+        continue;
+      }
+
+      char* p = message_buffer;
+
+      // Ajouter le point de départ
+      *p = '>';
+      p += 1;
+
+      // Copier le fichier sérialisé
+      memcpy(p, serialized_file, file_size);
+
+      // Envoyer la taille du message
+      if (write(sock, &message_size, sizeof(size_t)) == -1) {
+        perror("- x - Erreur lors de l'envoi de la taille du message");
+        free(serialized_file);
+        free(message_buffer);
+        free(buffer);
+        continue;
+      }
+
+      // Envoyer le message
+      if (write(sock, message_buffer, message_size) == -1) {
+        perror("- x - Erreur lors de l'envoi du message");
+        free(serialized_file);
+        free(message_buffer);
+        free(buffer);
+        continue;
+      }
+
+      free(serialized_file);
+      free(message_buffer);
+    }
     else {
       printf("- x - Commande non reconnue : %s\n", buffer);
     }
 
+    free(buffer);
   }
 
   // Remove the client socket from the array

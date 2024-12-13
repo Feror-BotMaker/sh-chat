@@ -17,9 +17,16 @@ typedef struct channel_t {
     int message_count;
 } Channel;
 
+typedef struct user_t {
+    char* username;
+    int socket_fd;
+} User;
+
 typedef struct state_t {
     Channel* channels;
     int channel_count;
+    User* users;
+    int user_count;
 } State;
 
 /**

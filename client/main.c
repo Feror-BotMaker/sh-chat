@@ -9,6 +9,35 @@
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include "../state.c"
+#include "../my_file_struct.c"
+#include <termios.h>
+
+void set_input_mode() {
+  struct termios t;
+
+  // Get current terminal attributes
+  tcgetattr(STDIN_FILENO, &t);
+
+  // Disable canonical mode and echo
+  t.c_lflag &= ~(ICANON | ECHO);
+
+  // Set the modified attributes
+  tcsetattr(STDIN_FILENO, TCSANOW, &t);
+}
+
+void reset_input_mode() {
+  struct termios t;
+
+  // Get current terminal attributes
+  tcgetattr(STDIN_FILENO, &t);
+
+  // Enable canonical mode and echo
+  t.c_lflag |= (ICANON | ECHO);
+
+  // Set the modified attributes
+  tcsetattr(STDIN_FILENO, TCSANOW, &t);
+}
+
 
 #define PRINT_USER_INPUT_SIGNAL 10
 
@@ -18,9 +47,35 @@ State* current_state = NULL;
 
 volatile char* user_input;
 
+pthread_mutex_t file_path_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 
 pthread_t state_thread;
 pthread_t input_thread;
+
+
+char* generate_random_uuid() {
+  // Sous la forme "xxxx-xxxx-xx"
+  char* uuid = malloc(15 * sizeof(char));
+
+  if (!uuid) {
+    perror("- x - Erreur lors de l'allocation de la mémoire pour l'UUID");
+    exit(1);
+  }
+
+  for (int i = 0; i < 14; i++) {
+    if (i == 4 || i == 9) {
+      uuid[i] = '-';
+    }
+    else {
+      uuid[i] = 'a' + (rand() % 26);
+    }
+  }
+
+  uuid[14] = '\0';
+
+  return uuid;
+}
 
 /**
  * @brief Affiche l'interface du client.
@@ -264,6 +319,33 @@ void* listen_for_new_state(void* arg) {
       exit(1);
     }
 
+    if (buffer[0] == '>') {
+      char* p = buffer + 1;
+
+      MyFileStruct* file = deserialize_my_file_struct(p);
+
+      if (!file) {
+        printf("- x - Erreur lors de la désérialisation du fichier\n");
+        free(buffer);
+        continue;
+      }
+
+      // On ajoute le fichier au dossier courant
+      FILE* file_ptr = fopen(file->file_name, "wb");
+
+      if (!file_ptr) {
+        printf("- x - Erreur lors de l'ouverture du fichier %s\n", file->file_name);
+        free(buffer);
+        continue;
+      }
+
+      fwrite(file->file_content, sizeof(char), strlen(file->file_content), file_ptr);
+
+      fclose(file_ptr);
+
+      display_state(current_state);
+    }
+
     printf("- √ - État reçu\n");
     State* state = deserialize_state(buffer);
 
@@ -291,7 +373,7 @@ void* listen_for_new_state(void* arg) {
 
 void print_user_input(int signal) {
   char* buffer = strdup((const char*)user_input);
-  printf("%s", strlen(buffer) > 0 ? buffer : "(vide)");
+  printf("%s", strlen(buffer) > 0 ? buffer : "|");
   fflush(stdout);
 }
 
@@ -305,10 +387,11 @@ void print_user_input(int signal) {
 void* expect_user_input(void* arg) {
   int client_socket = *(int*)arg;
 
+  setvbuf(stdin, NULL, _IONBF, 0); //turn off buffering for stdin
+
   // Initialiser le user_input
-  user_input = malloc(2 * sizeof(char));
-  user_input[0] = 'a';
-  user_input[1] = '\0';
+  user_input = malloc(1 * sizeof(char));
+  user_input[0] = '\0';
 
   // On lie le signal à la fonction d'affichage
   signal(PRINT_USER_INPUT_SIGNAL, print_user_input);
@@ -322,21 +405,31 @@ void* expect_user_input(void* arg) {
         if (strlen(user_input) > 0) {
           break;
         }
-        else {
-          continue;
-        }
       }
 
-      // On ajoute le charactère au global user_input
-      size_t user_input_length = strlen((const char*)user_input);
-      user_input = realloc((void*)user_input, user_input_length + 2);
-      if (!user_input) {
-        perror("- x - Erreur lors de la réallocation de la mémoire pour la saisie utilisateur");
-        close(client_socket);
-        exit(1);
+      if (c == 127) {
+        // On supprime le dernier charactère
+        size_t user_input_length = strlen((const char*)user_input);
+        if (user_input_length > 0) {
+          user_input[user_input_length - 1] = '\0';
+        }
+        display_state(current_state);
       }
-      user_input[user_input_length] = c;
-      user_input[user_input_length + 1] = '\0';
+      else {
+
+        // On ajoute le charactère au global user_input
+        size_t user_input_length = strlen((const char*)user_input);
+        user_input = realloc((void*)user_input, user_input_length + 2);
+        if (!user_input) {
+          perror("- x - Erreur lors de la réallocation de la mémoire pour la saisie utilisateur");
+          close(client_socket);
+          exit(1);
+        }
+        user_input[user_input_length] = c;
+        user_input[user_input_length + 1] = '\0';
+
+        display_state(current_state);
+      }
     }
 
     char* buffer = strdup((const char*)user_input);
@@ -403,6 +496,174 @@ void* expect_user_input(void* arg) {
         printf("- √ - Message envoyé\n");
         free(message_buffer);
       }
+      else if (strncmp(buffer, "/send-file", 10) == 0) {
+        // On va envoyer un fichier
+        // La fonction /send-file s'utilise tel quel:
+        // /send-file <file_path>
+
+        // On commence par récupérer le chemin du fichier
+        strtok(buffer, " ");
+        char* file_path = strdup(strtok(NULL, " "));
+
+        if (file_path == NULL) {
+          printf("- x - Veuillez spécifier un fichier à envoyer\n");
+          free(buffer);
+          continue;
+        }
+
+        // On commence par ouvrir le fichier
+        FILE* file = fopen(file_path, "r");
+        if (file == NULL) {
+          printf("- x - Impossible d'ouvrir le fichier\n");
+          free(buffer);
+          continue;
+        }
+
+        // On récupère la taille du fichier
+        fseek(file, 0, SEEK_END);
+        size_t file_size = ftell(file);
+
+        // On revient au début du fichier
+        fseek(file, 0, SEEK_SET);
+
+        // On lit le contenu du fichier
+        char* file_buffer = malloc(file_size);
+        if (file_buffer == NULL) {
+          printf("- x - Impossible d'allouer la mémoire pour le fichier\n");
+          fclose(file);
+          free(buffer);
+          continue;
+        }
+
+        if (fread(file_buffer, 1, file_size, file) != file_size) {
+          printf("- x - Impossible de lire le contenu du fichier\n");
+          fclose(file);
+          free(file_buffer);
+          free(buffer);
+          continue;
+        }
+
+        fclose(file);
+
+        // On sérialise le fichier
+        MyFileStruct* my_file_struct = malloc(sizeof(MyFileStruct));
+        my_file_struct->file_name = strdup(file_path);
+        my_file_struct->file_content_size = file_size;
+        my_file_struct->file_content = malloc(file_size);
+        memcpy(my_file_struct->file_content, file_buffer, file_size);
+        my_file_struct->file_content[file_size] = '\0';
+        my_file_struct->uuid = generate_random_uuid();
+
+        size_t size;
+        char* serialized_file = serialize_my_file_struct(my_file_struct, &size);
+
+        // On envoie le fichier
+        // Le format du message est .<channel> <serialized_file>
+        // Calculer les tailles
+        size_t channel_name_len = strlen(selected_channel->name);
+        size_t message_size = 1 + channel_name_len + 1 + size; // '.' + channel_name + ' ' + serialized_file
+
+        // Allouer le buffer du message
+        char* message_buffer = malloc(message_size);
+        if (!message_buffer) {
+          perror("- x - Error allocating message buffer");
+          close(client_socket);
+          exit(1);
+        }
+
+        char* p = message_buffer;
+
+        // Ajouter le point de départ
+        *p = '.';
+        p += 1;
+
+        // Copier le nom du canal
+        memcpy(p, selected_channel->name, channel_name_len);
+        p += channel_name_len;
+
+        // Ajouter un espace
+        *p = ' ';
+        p += 1;
+
+        // Copier le fichier sérialisé (Binaires)
+        memcpy(p, serialized_file, size);
+
+        // Envoyer la taille du message
+        if (write(client_socket, &message_size, sizeof(size_t)) == -1) {
+          perror("- x - Erreur lors de l'envoi de la taille du message");
+          close(client_socket);
+          exit(1);
+        }
+
+        // Envoyer le message
+        if (write(client_socket, message_buffer, message_size) == -1) {
+          perror("- x - Erreur lors de l'envoi du message");
+          close(client_socket);
+          exit(1);
+        }
+
+        printf("- √ - Message envoyé\n");
+
+        free(message_buffer);
+        free(serialized_file);
+      }
+      else if (strncmp(buffer, "/download", 9) == 0) {
+        // On va aller demander le téléchargement d'un fichier
+        // La fonction /download s'utilise tel quel:
+        // /download <uuid>
+
+        strtok(buffer, " ");
+
+        char* uuid = strtok(NULL, " ");
+
+        if (uuid == NULL) {
+          printf("- x - Veuillez spécifier l'UUID du fichier à télécharger\n");
+          free(buffer);
+          continue;
+        }
+
+        // On envoie la demande de téléchargement
+        // Le format du message est <<uuid>
+        // Calculer les tailles
+        size_t uuid_len = strlen(uuid);
+        size_t message_size = uuid_len + 2; // <uuid
+
+        // Allouer le buffer du message
+        char* message_buffer = malloc(message_size);
+
+        if (!message_buffer) {
+          perror("- x - Erreur lors de l'allocation du tampon de message");
+          close(client_socket);
+          exit(1);
+        }
+
+        char* p = message_buffer;
+
+        // Ajouter le point de départ
+        *p = '<';
+        p += 1;
+
+        // Copier l'UUID
+        memcpy(p, uuid, uuid_len);
+        p += uuid_len;
+
+        // Caractère de fin
+        *p = '\0';
+
+        // Envoyer la taille du message
+        if (write(client_socket, &message_size, sizeof(size_t)) == -1) {
+          perror("- x - Erreur lors de l'envoi de la taille du message");
+          close(client_socket);
+          exit(1);
+        }
+
+        // Envoyer le message
+        if (write(client_socket, message_buffer, message_size) == -1) {
+          perror("- x - Erreur lors de l'envoi du message");
+          close(client_socket);
+          exit(1);
+        }
+      }
     }
     else {
       // Dans le cas contraire, on envoi le message au serveur
@@ -460,10 +721,13 @@ void* expect_user_input(void* arg) {
 }
 
 int main(int argc, char* argv[]) {
+  set_input_mode();
   if (argc != 3) {
     fprintf(stderr, "- x - Usage: %s <Adresse IP> <Port>\n", argv[0]);
     exit(1);
   }
+
+  setvbuf(stdin, NULL, _IONBF, 0); //turn off buffering for stdin
 
   const char* ip_address = argv[1];
   int port = atoi(argv[2]);
