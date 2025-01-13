@@ -20,7 +20,9 @@ Ce logiciel est performant, et ne comporte aucune fuite de mémoire (normalement
 
 Pour utiliser ce logiciel, vous aurez besoin de :
 
-- `gcc` (ou tout autre compilateur C, merci de modifier les scripts `run.sh` en conséquence)
+- `gcc` (ou tout autre compilateur C, merci de modifier les scripts `run.sh` en conséquence).
+- Un ordinateur qui s'allume.
+- Un OS Unix-like (Linux, MacOS, BSD, etc.).
 
 ### Démarrer le serveur
 
