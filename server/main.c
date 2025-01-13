@@ -22,6 +22,7 @@ int client_sockets[MAX_CLIENTS];
 pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 State server_state;
+pthread_mutex_t server_state_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 MyFileStruct* stored_files;
 int stored_files_count = 0;
@@ -92,12 +93,115 @@ void* handle_client(void* client_socket) {
   }
   pthread_mutex_unlock(&clients_mutex);
 
+
   if (socket_index == -1) {
     perror("- x - Trop de clients connectés\n");
     close(sock);
     free(client_socket);
     pthread_exit(NULL);
   }
+
+  pthread_mutex_lock(&server_state_mutex);
+
+  printf("Debug: Before user add - current users: %d\n", server_state.user_count);
+  for (int i = 0; i < server_state.user_count; i++) {
+    printf("Debug: User[%d] = %s (fd: %d)\n",
+      i, server_state.users[i].username,
+      server_state.users[i].socket_fd);
+  }
+
+  if (server_state.user_count == 0) {
+    server_state.users = malloc(sizeof(User));
+    if (!server_state.users) {
+      perror("malloc failed");
+      pthread_mutex_unlock(&server_state_mutex);
+      close(sock);
+      pthread_exit(NULL);
+    }
+    server_state.users[0].socket_fd = socket_index;
+    server_state.users[0].username = strdup("User0");
+    if (!server_state.users[0].username) {
+      perror("username malloc failed");
+      free(server_state.users);
+      pthread_mutex_unlock(&server_state_mutex);
+      close(sock);
+      pthread_exit(NULL);
+    }
+    server_state.user_count = 1;
+  }
+  else {
+    // Store existing usernames temporarily
+    char** temp_usernames = malloc(server_state.user_count * sizeof(char*));
+    if (!temp_usernames) {
+      perror("malloc failed for temp usernames");
+      pthread_mutex_unlock(&server_state_mutex);
+      close(sock);
+      pthread_exit(NULL);
+    }
+
+    // Deep copy existing usernames
+    for (int i = 0; i < server_state.user_count; i++) {
+      temp_usernames[i] = strdup(server_state.users[i].username);
+      if (!temp_usernames[i]) {
+        // Cleanup previous allocations on failure
+        for (int j = 0; j < i; j++) {
+          free(temp_usernames[j]);
+        }
+        free(temp_usernames);
+        pthread_mutex_unlock(&server_state_mutex);
+        close(sock);
+        pthread_exit(NULL);
+      }
+    }
+
+    // Perform realloc
+    size_t new_size = sizeof(User) * (server_state.user_count + 1);
+    User* temp = realloc(server_state.users, new_size);
+    if (!temp) {
+      for (int i = 0; i < server_state.user_count; i++) {
+        free(temp_usernames[i]);
+      }
+      free(temp_usernames);
+      perror("realloc failed");
+      pthread_mutex_unlock(&server_state_mutex);
+      close(sock);
+      pthread_exit(NULL);
+    }
+
+    // Free old usernames and restore from temp
+    for (int i = 0; i < server_state.user_count; i++) {
+      free(server_state.users[i].username);
+      server_state.users[i].username = temp_usernames[i];
+    }
+    free(temp_usernames);
+
+    server_state.users = temp;
+
+    // Add new user
+    int idx = server_state.user_count;
+    server_state.users[idx].socket_fd = socket_index;
+    char username[32];
+    snprintf(username, sizeof(username), "User%d", socket_index);
+    server_state.users[idx].username = strdup(username);
+    if (!server_state.users[idx].username) {
+      perror("username malloc failed");
+      pthread_mutex_unlock(&server_state_mutex);
+      close(sock);
+      pthread_exit(NULL);
+    }
+    server_state.user_count++;
+  }
+
+  printf("Debug: After user add - current users: %d\n", server_state.user_count);
+  for (int i = 0; i < server_state.user_count; i++) {
+    printf("Debug: User[%d] = %s (fd: %d)\n",
+      i, server_state.users[i].username,
+      server_state.users[i].socket_fd);
+  }
+
+  pthread_mutex_unlock(&server_state_mutex);
+
+  printf("- i - Client connecté\n");
 
   client_sockets[socket_index] = sock;
   free(client_socket);
@@ -235,6 +339,44 @@ void* handle_client(void* client_socket) {
       server_state.channels[server_state.channel_count].message_count = 1;
       server_state.channel_count++;
       pthread_mutex_unlock(&clients_mutex);
+
+      // Envoyer le nouvel état à tous les clients
+      broadcast_state(&server_state);
+
+      // Enregistrer le nouvel état dans un fichier
+      save_state_to_file(&server_state, "state.bin");
+    }
+    else if (buffer[0] == '?') { // Si le message commence par un ?, on change un pseudo
+      char* new_username = buffer + 1;
+
+      // Vérifier si le pseudo existe déjà
+      for (int i = 0; i < server_state.user_count; i++) {
+        if (strcmp(server_state.users[i].username, new_username) == 0) {
+          printf("- x - Pseudo déjà existant : %s\n", new_username);
+          break;
+        }
+      }
+
+      // Modifier le pseudo
+      pthread_mutex_lock(&clients_mutex);
+      User* user = NULL;
+      for (int i = 0; i < server_state.user_count; i++) {
+        if (server_state.users[i].socket_fd == socket_index) {
+          user = &server_state.users[i];
+          break;
+        }
+      }
+      pthread_mutex_unlock(&clients_mutex);
+
+      if (user == NULL) {
+        printf("- x - Utilisateur non trouvé\n");
+        free(buffer);
+        continue;
+      }
+
+      user->username = strdup(new_username);
+
+      printf("- i - Pseudo modifié avec succès\n");
 
       // Envoyer le nouvel état à tous les clients
       broadcast_state(&server_state);
@@ -473,6 +615,8 @@ int main(int argc, char* argv[]) {
 
     server_state.channel_count = 2;
   }
+
+  server_state.user_count = 0;
 
   if (argc != 3) {
     fprintf(stderr, "- x - Usage: %s <Adresse IP> <Port>\n", argv[0]);

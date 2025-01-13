@@ -202,7 +202,21 @@ void display_state(State* state) {
         snprintf(user, 40, "\033[1;31mServer (%02d:%02d:%02d) >\033[0;0m ", h, m, s);
       }
       else {
-        snprintf(user, 40, "\033[1;33mUser%d (%02d:%02d:%02d) >\033[0;0m ", message->sender_fd, h, m, s);
+        // On récupère le nom de l'utilisateur dans le state
+        char* username = NULL;
+        for (int j = 0; j < state->user_count; j++) {
+          if (state->users[j].socket_fd == message->sender_fd) {
+            username = state->users[j].username;
+            break;
+          }
+        }
+
+        if (username) {
+          snprintf(user, 40, "\033[1;33m%s (%02d:%02d:%02d) >\033[0;0m ", username, h, m, s);
+        }
+        else {
+          snprintf(user, 40, "\033[1;33mUser%d (%02d:%02d:%02d) >\033[0;0m ", message->sender_fd, h, m, s);
+        }
       }
 
       int user_length = strlen(user);
@@ -495,6 +509,52 @@ void* expect_user_input(void* arg) {
 
         printf("- √ - Message envoyé\n");
         free(message_buffer);
+      }
+      else if (strncmp(buffer, "/nick", 5) == 0) {
+        // On va changer de pseudo
+        // La fonction /nick s'utilise tel quel:
+        // /nick <new_username>
+
+        // On commence par récupérer le nouveau pseudo
+        strtok(buffer, " ");
+        char* new_username = strdup(strtok(NULL, " "));
+
+        if (new_username == NULL) {
+          printf("- x - Veuillez spécifier un nouveau pseudo\n");
+          free(buffer);
+          continue;
+        }
+
+        // On sérialise le message sous la forme "?<new_username>"
+        size_t message_size = 1 + strlen(new_username) + 1;
+
+        char* message_buffer = malloc(message_size);
+
+        if (!message_buffer) {
+          perror("- x - Erreur lors de l'allocation du tampon de message");
+          close(client_socket);
+          exit(1);
+        }
+
+        snprintf(message_buffer, message_size, "?%s", new_username);
+
+        // Envoyer la taille du message
+        if (write(client_socket, &message_size, sizeof(size_t)) == -1) {
+          perror("- x - Erreur lors de l'envoi de la taille du message");
+          close(client_socket);
+          exit(1);
+        }
+
+        printf("- √ - Taille envoyée\n");
+
+        // Envoyer le message
+        if (write(client_socket, message_buffer, message_size) == -1) {
+          perror("- x - Erreur lors de l'envoi du message");
+          close(client_socket);
+          exit(1);
+        }
+
+        printf("- √ - Message envoyé\n");
       }
       else if (strncmp(buffer, "/send-file", 10) == 0) {
         // On va envoyer un fichier

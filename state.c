@@ -51,6 +51,12 @@ char* serialize_state(const State* state, size_t* size_out) {
         }
     }
 
+    size += sizeof(int); // Pour stocker `user_count`
+    for (int i = 0; i < state->user_count; i++) {
+        User* user = &state->users[i];
+        size += strlen(user->username) + 1 + sizeof(int); // nom d'utilisateur + null(\0) + socket_fd
+    }
+
     char* buffer = malloc(size);
     if (!buffer) return NULL;
 
@@ -90,6 +96,24 @@ char* serialize_state(const State* state, size_t* size_out) {
             memcpy(p, &message->timestamp, sizeof(time_t));
             p += sizeof(time_t);
         }
+    }
+
+    // On sérialise le compte du nombre d'utilisateurs
+    memcpy(p, &state->user_count, sizeof(int));
+    p += sizeof(int); // Puis on décale de la taille d'un entier
+
+    // Pour chaque utilisateur
+    for (int i = 0; i < state->user_count; i++) {
+        User* user = &state->users[i];
+
+        // On sérialise le nom d'utilisateur
+        size_t username_len = strlen(user->username) + 1;
+        memcpy(p, user->username, username_len);
+        p += username_len;
+
+        // Puis le socket_fd de l'utilisateur
+        memcpy(p, &user->socket_fd, sizeof(int));
+        p += sizeof(int);
     }
 
     // On stock la taille totale du buffer dans la variable en sortie (pour connaître la taille à envoyer)
@@ -152,10 +176,34 @@ State* deserialize_state(const char* buffer) {
         }
     }
 
+    // On déserialise le nombre d'utilisateurs
+    int user_count;
+    memcpy(&user_count, p, sizeof(int));
+    p += sizeof(int);
+
+    // On alloue le nombre d'utilisateurs adéquat.
+    User* users = malloc(user_count * sizeof(User));
+    if (!users) return NULL;
+
+    // Puis pour chaque utilisateur
+    for (int i = 0; i < user_count; i++) {
+        // On déserialise le nom d'utilisateur
+        size_t username_len = strlen(p) + 1; // +1 pour \0
+        users[i].username = malloc(username_len);
+        strcpy(users[i].username, p);
+        p += username_len;
+
+        // Puis on déserialise le socket_fd de l'utilisateur
+        memcpy(&users[i].socket_fd, p, sizeof(int));
+        p += sizeof(int);
+    }
+
     // Finalement, on alloue un peu de mémoire pour l'état
     State* state = malloc(sizeof(State));
     state->channels = channels;
     state->channel_count = channel_count;
+    state->users = users;
+    state->user_count = user_count;
 
     // Et on le renvoie
     return state;
