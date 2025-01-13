@@ -1,1 +1,1 @@
-clang *.c -o sh-chat-server && ./sh-chat-server "$@"
+gcc *.c -o sh-chat-server && ./sh-chat-server "$@"
